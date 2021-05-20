@@ -1,0 +1,7 @@
+#!/bin/bash
+
+docker build --quiet docker --tag rnd-html
+docker run --rm -ti \
+    --mount=type=bind,source=$PWD,destination=/src \
+    --workdir=/src \
+    rnd-html "$@"

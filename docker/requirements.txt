@@ -1,0 +1,6 @@
+warcio
+requests-cache
+chardet
+tqdm
+pyarrow
+html5prescan

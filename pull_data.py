@@ -13,6 +13,7 @@ import re
 
 #import chardet
 import html5prescan
+import sniffpy
 import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
@@ -83,18 +84,25 @@ def body_text(rec, src):
             seen += (enc,)
             if enc not in seen:
                 seen |= set((enc,))
-                return str(data, enc)
+                # for now we're letting the minimizer decide, because the
+                # enabled detectors and encoding attempts are all cheap
+                #return str(data, enc)
         except TypeError: # None
             seen += (None,)
         except LookupError: # unknown charset
             seen += (enc,)
         except UnicodeError:
             pass
-    # fallback, minimize encoding failures
+    # fallback, compare candidates to minimize obvious encoding issues
     def lossy(enc):
         try:
             txt = str(data, enc, 'replace')
-            return(txt, txt.count("�"), enc)
+            # more characters is obvious mojibake
+            # more replacement characters is a secondary heuristic
+            # (cheap hack here to combine primary and secondary int
+            # comparisons into one float comparison because lazy)
+            score = 1.0 * len(txt) * (1 - 2 / (1 + txt.count("�")))
+            return(txt, score, enc)
         except (TypeError, LookupError):
             return('', float('inf'), enc)
     win = min(map(lossy, set(seen)), key=lambda t: t[1])
@@ -131,32 +139,35 @@ def scan_warc_file(src):
             if len(evts):
                 raise(NotImplementedError('unpaired records'))
 
-    def flat_msg(t):
-        rec, body = t
-        m = rec.http_headers
-        return "\r\n".join(
-            (f"{m.protocol} {m.statusline}",) +
-            tuple(f"{k}: {v}" for k, v in m.headers) +
-            ('', body_text(rec, body),)
-        )
-
     for evt in group():
         req = evt.get('request')
         res = evt.get('response')
         dat = evt.get('metadata')
-        ct = res[0].http_headers.get('content-type')
-        if ct and re.match(r'(?i)text/html\b', ct):
-            hdr = email.parser.BytesParser().parsebytes(dat[1])
-            ftm = hdr.get('fetchTimeMs')
-            yield {
-                'uri': req[0].rec_headers.get_header('WARC-Target-URI'),
-                'req': flat_msg(req),
-                'res': flat_msg(res),
-                'when': datetime.datetime.strptime(
-                    req[0].rec_headers.get_header('WARC-Date'),
-                    '%Y-%m-%dT%H:%M:%SZ'),
-                'duration': float(ftm) / 1000.0 if ftm else None,
-            }
+        if len(res[1]):
+            try:
+                # implements https://mimesniff.spec.whatwg.org/
+                mt = sniffpy.sniff(res[1])
+                if mt.type != 'text' or mt.subtype != 'html':
+                    continue
+            except:
+                continue
+        body = body_text(*res).rstrip("\0")
+        if "\0" in body:
+            # null bytes in the middle of the stream are rare, but
+            # problematic
+            continue
+        hdr = email.parser.BytesParser().parsebytes(dat[1])
+        ftm = hdr.get('fetchTimeMs')
+        yield {
+            'html': body,
+            'uri': req[0].rec_headers.get_header('WARC-Target-URI'),
+            'req': req[0].http_headers.to_str() + "\r\n" + body_text(*req),
+            'res': res[0].http_headers.to_str(),
+            'when': datetime.datetime.strptime(
+                req[0].rec_headers.get_header('WARC-Date'),
+                '%Y-%m-%dT%H:%M:%SZ'),
+            'duration': float(ftm) / 1000.0 if ftm else None,
+        }
 
 def batch(src, n):
     it = iter(src)
@@ -182,6 +193,7 @@ if __name__ == '__main__':
     src = tqdm.tqdm(src)
     src = batch(src, 128)
     toParq('cc-html.parquet', src, pa.schema((
+        ('html', pa.string()),
         ('uri', pa.string()),
         ('req', pa.string()),
         ('res', pa.string()),

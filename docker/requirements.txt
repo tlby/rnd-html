@@ -1,6 +1,11 @@
 warcio
 requests-cache
-chardet
 tqdm
 pyarrow
 html5prescan
+sniffpy
+sentencepiece
+torch
+datasets
+transformers
+protobuf

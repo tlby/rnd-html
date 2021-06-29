@@ -9,7 +9,7 @@ import numpy
 
 VERSION = '0.0.1'
 
-class PqDataset(datasets.GeneratorBasedBuilder):
+class PqDataset(datasets.ArrowBasedBuilder):
     BUILDER_CONFIGS = (
         datasets.BuilderConfig(
             name='cc-html',
@@ -39,14 +39,12 @@ class PqDataset(datasets.GeneratorBasedBuilder):
             citation=None,
         )
     def _split_generators(self, dl_manager):
-        tbl = pyarrow.parquet.read_table(f'{self.config.name}.parquet')
-        return [
-            datasets.SplitGenerator(name=datasets.Split.TRAIN,
-                gen_kwargs={ 'split': tbl }),
-        ]
-    def _generate_examples(self, split):
-        for i, s in split.to_pandas().iterrows():
-            yield i, dict(s.items())
+        return [ datasets.SplitGenerator(
+            name=datasets.Split.TRAIN,
+            gen_kwargs={ 'file': f'{self.config.name}.parquet' },
+        ) ]
+    def _generate_tables(self, file):
+        yield 0, pyarrow.parquet.read_table(file)
 
 ##### METRIC
 
@@ -74,7 +72,7 @@ def mcc(cm):
 ''', '''
     (Accuracy,MCC,Rpb,CM)
 ''')
-class AzMetric(datasets.Metric):
+class PqMetric(datasets.Metric):
     """(Accuracy,MCC,Rpb,CM)"""
 
     def _info(self):
@@ -107,6 +105,6 @@ class AzMetric(datasets.Metric):
             'acc': acc(cm),
             'mcc': mcc(cm),
             'rpb': mcc(cmx),
-            'cm': cm.astype('int64').tolist(),
+            #'cm': cm.astype('int64').tolist(),
         }
 

@@ -60,7 +60,6 @@ def run(size):
         split_by_number=False,
         #split_by_whitespace=False,
         treat_whitespace_as_suffix=True,
-        user_defined_symbols=['<pad>', '<mask>'],
     )
     if False:
         # this will get the model into a format that can be read by 

@@ -9,3 +9,4 @@ torch
 datasets
 transformers
 protobuf
+pycryptodome

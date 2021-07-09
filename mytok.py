@@ -184,8 +184,6 @@ class SentencePieceTokenizer(PreTrainedTokenizer):
         open(out_vocab_file, 'wb').write(self.model_proto)
         return (out_vocab_file,)
 
-transformers.TOKENIZER_MAPPING['SentencePieceConfig'] = (SentencePieceTokenizer, None)
-
 class TrimmedSentencePieceTokenizer(SentencePieceTokenizer):
     ''' SentencePiece tokenizer max_length hint optimization.
 
@@ -237,4 +235,8 @@ class TrimmedSentencePieceTokenizer(SentencePieceTokenizer):
             text = text[:trim]
         return super().tokenize(text, **kwds)
 
-transformers.TOKENIZER_MAPPING['TrimmedSentencePieceConfig'] = (TrimmedSentencePieceTokenizer, None)
+# make these available to AutoTokenizer.from_pretrained()
+transformers.models.auto.tokenization_auto.NO_CONFIG_TOKENIZER += [
+    SentencePieceTokenizer,
+    TrimmedSentencePieceTokenizer,
+]

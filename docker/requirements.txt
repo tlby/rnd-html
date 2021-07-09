@@ -6,7 +6,8 @@ html5prescan
 sniffpy
 sentencepiece
 torch
-datasets
+datasets>=1.9 # need huggingface/datasets#2453 for run_mlm.py use of `column_names[0]`
 transformers
 protobuf
 pycryptodome
+markdown

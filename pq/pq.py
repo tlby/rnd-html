@@ -1,7 +1,9 @@
-# stuff a Parquet file into the datasets api
+# coding=utf-8
+
+from dataclasses import dataclass
+from typing import Optional
 
 import datasets
-import pyarrow
 import pyarrow.parquet
 import numpy
 
@@ -9,39 +11,28 @@ import numpy
 
 VERSION = '0.0.1'
 
+@dataclass
+class PqConfig(datasets.BuilderConfig):
+    """BuilderConfig for Parquet."""
+    def __post_init__(self):
+        # this lets `load_dataset('pq', 'data')` work shorthand for
+        # `load_dataset('pq', data_files='data.parquet')`
+        if self.data_files is None:
+            self.data_files = self.name + '.parquet'
+
 class PqDataset(datasets.ArrowBasedBuilder):
-    BUILDER_CONFIGS = (
-        datasets.BuilderConfig(
-            name='cc-html',
-            version=VERSION,
-            description='HTML extracted from commoncrawl.org sample',
-        ),
-    )
+    BUILDER_CONFIG_CLASS = PqConfig
+
     def _info(self):
-        features = datasets.Features.from_arrow_schema(
-            pyarrow.parquet.read_metadata(
-                f'{self.config.name}.parquet'
-            ).schema.to_arrow_schema())
+        meta = pyarrow.parquet.read_metadata(self.config.data_files)
         return datasets.DatasetInfo(
-            # This is the description that will appear on the datasets page.
-            description=self.config.description,
-            # This defines the different columns of the dataset and their types
-            features=features,
-            # If there's a common (input, target) tuple from the features,
-            # specify them here. They'll be used if as_supervised=True in
-            # builder.as_dataset.
-            supervised_keys=None,
-            # Homepage of the dataset for documentation
-            homepage=None,
-            # License for the dataset if available
-            license=None,
-            # Citation for the dataset
-            citation=None,
+            features=datasets.Features.from_arrow_schema(
+                meta.schema.to_arrow_schema()),
         )
     def _split_generators(self, dl_manager):
         return [ datasets.SplitGenerator(
             name=datasets.Split.TRAIN,
-            gen_kwargs={ 'file': f'{self.config.name}.parquet' },
+            gen_kwargs={'file': self.config.data_files},
         ) ]
     def _generate_tables(self, file):
         yield 0, pyarrow.parquet.read_table(file)

@@ -67,6 +67,7 @@ class SentencePieceTokenizer(PreTrainedTokenizer):
         sep_token=None,
         mask_token=None,
         additional_special_tokens=[],
+        model_max_length=1024**2,
         **kwargs
     ):
         # TODO: sentencepiece_processor.cc defines
@@ -136,6 +137,7 @@ class SentencePieceTokenizer(PreTrainedTokenizer):
             sep_token=sep_token,
             mask_token=mask_token,
             additional_special_tokens=additional_special_tokens,
+            model_max_length=model_max_length,
             **kwargs,
         )
         self.model_proto = buf

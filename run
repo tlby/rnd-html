@@ -25,6 +25,8 @@ then
     ARGS=("${ARGS[@]}" --runtime=nvidia)
 fi
 
+[ -t 0 ] && ARGS=(-ti "${ARGS[@]}")
+
 case "$1" in
     --build)
         docker build docker --tag rnd-html
@@ -32,4 +34,4 @@ case "$1" in
         ;;
 esac
 
-docker run --rm -ti "${ARGS[@]}" rnd-html "$@"
+docker run --rm "${ARGS[@]}" rnd-html "$@"

@@ -18,10 +18,55 @@ import signal
 import subprocess
 import sys
 
+import datasets
+import numpy
 import torch
 import transformers
 
 import mytok # TODO: huggingface/transformers#10256 could obviate this
+
+def softmax(x, axis=None):
+    e_x = numpy.exp(x - numpy.max(x, axis=axis, keepdims=True))
+    return e_x / numpy.sum(e_x, axis=axis, keepdims=True)
+
+def acc(cm):
+    '''returns Accuracy given N×N Confusion Matrix'''
+    return cm.diagonal().sum() * cm.sum() ** -1
+
+def mcc(cm):
+    '''returns Matthews correlation coefficient given N×N Confusion Matrix'''
+    n = cm.sum()
+    x = cm.sum(axis=-2)
+    y = cm.sum(axis=-1)
+    cov_xx = numpy.sum(x * (n - x))
+    cov_yy = numpy.sum(y * (n - y))
+    i = cm.diagonal()
+    cov_xy = numpy.sum(i * n - x * y)
+    return cov_xy * (cov_xx * cov_yy) ** -0.5
+
+class Metric(datasets.Metric):
+    def _info(self):
+        return datasets.MetricInfo(
+            description='(Accuracy,MCC,Rpb,CM)',
+            citation=None,
+            features=datasets.Features({
+                'predictions': datasets.Sequence(datasets.Value('double')),
+                'references': datasets.Value('int32'),
+            }),
+        )
+    def _compute(self, predictions, references, axis=-1):
+        preds = numpy.array(predictions)
+        N = preds.shape[axis]
+        I = numpy.eye(N) # cheap trick to one_hot encode
+        cm = numpy.matmul(I[references].T, I[numpy.argmax(preds, axis=axis)])
+        # Rpb is like MCC, but scores low confidence predictions lower
+        cmx = numpy.matmul(I[references].T, softmax(preds, axis=axis))
+        return {
+            'acc': acc(cm),
+            'mcc': mcc(cm),
+            'rpb': mcc(cmx),
+            #'cm': cm.astype('int64').tolist(),
+        }
 
 def configure(args, dst):
         # Mostly what this does is wire in our own tokenizer and scale
@@ -128,8 +173,59 @@ def pretrain(src, dst):
             '--output_dir', dst,
         ))
 
+def patch_finetune(module_name, task):
+    # TODO: stop hot patching things
+    # huggingface/transformers publishes example training scripts.  They
+    # are getting more configurable with each release.  It's now at the
+    # point that I don't have to edit the script to run our finetuning
+    # task, but I _do_ have to hot patch in a few changes.
+    m = importlib.import_module(module_name)
+    m.task_to_keys[task] = ('sentence', None)
+    def load_dataset_shim(path, name=None, **kwds):
+        if path != 'glue' or 'formcats' not in name:
+            return datasets.load_dataset(path, name, **kwds)
+        # format dataset into (sentence, label) pairs
+        cl = datasets.ClassLabel(names=(
+            "search", "login", "other", "multi",
+            "change", "add", "delete", "save",
+            "spam", "session", "recovery"))
+        fe = datasets.Features((
+            ('sentence', datasets.Value('string')),
+            ('label', cl)))
+        ds = datasets.load_dataset('pq', task, split='train')
+        ds = ds.map(
+            function=lambda v: {
+                'sentence': v['form'],
+                'label': cl.str2int(v['label']) },
+            remove_columns=[ c for c in ds.features ],
+            features=fe,
+        )
+        # there is only a train set, so we need to do the splits here
+        split = ds.train_test_split(1/8)
+        ds_train = split['train'] # 7/8th to train
+        split = split['test'].train_test_split(1/2)
+        ds_guide = split['train'] # 1/16th to guide
+        ds_proof = split['test']  # 1/16th to proof
+        return datasets.DatasetDict({
+            'train': ds_train,
+            'validation': ds_guide,
+            'test': ds_proof,
+        })
+    m.load_dataset = load_dataset_shim
+    # noop load_metric() since it's result is only used by compute_metrics()
+    m.load_metric = lambda *args: None
+    metric = Metric()
+    def compute_metrics(batch):
+        return metric.compute(
+            predictions=batch.predictions, references=batch.label_ids)
+    def Trainer_shim(**kwds):
+        kwds['compute_metrics'] = compute_metrics
+        return transformers.Trainer(**kwds)
+    m.Trainer = Trainer_shim
+
 def finetune(src, dst, task):
     cfg = transformers.AutoConfig.from_pretrained(src)
+    patch_finetune('run_glue', task)
     batch_size_autoscale(lambda batch_size, gradient_accumulation_steps:
         train('run_glue.py',
             '--model_name_or_path', src,

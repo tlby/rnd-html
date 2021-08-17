@@ -13,6 +13,7 @@ export DATA=${DATA:-$(readlink -f data)} # user can symlink a custom path
 export DATA=${DATA:-/data}
 
 ARGS=(
+    --network=host
     --mount=type=bind,source="$PWD",destination=/src
     --mount=type=bind,source="$DATA",destination=/data
     --env=TRANSFORMERS_CACHE=/data/cache/huggingface/transformers

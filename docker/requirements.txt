@@ -11,3 +11,5 @@ transformers
 protobuf
 pycryptodome
 markdown
+altair
+s3fs

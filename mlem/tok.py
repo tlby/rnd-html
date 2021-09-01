@@ -1,28 +1,20 @@
-""" Tokenization class for SentencePiece."""
-import math
-import sys
-import os
-from typing import Dict, Optional, Tuple
 
+# this both trains spm tokenizers and implements the
+# huggingface/tokenizers bindings
+
+import math
+import os
+import pathlib
+import re
+import sys
+import typing
+
+import datasets
 import sentencepiece as spm
 import sentencepiece.sentencepiece_model_pb2 as model_pb2
-
 import transformers
-from transformers.tokenization_utils import PreTrainedTokenizer
 
-VOCAB_FILES_NAMES = {"vocab_file": "spiece.model"}
-
-PRETRAINED_VOCAB_FILES_MAP = {
-    "vocab_file": {
-    }
-}
-
-# this is the low level class, the one we expose will be adaptive based
-# on max_length to be more performant
-PRETRAINED_POSITIONAL_EMBEDDINGS_SIZES = {
-}
-
-class SentencePieceTokenizer(PreTrainedTokenizer):
+class SentencePieceTokenizer(transformers.tokenization_utils.PreTrainedTokenizer):
     """
     Construct a SentencePiece tokenizer using `SentencePiece <https://github.com/google/sentencepiece>`__ .
 
@@ -53,9 +45,9 @@ class SentencePieceTokenizer(PreTrainedTokenizer):
             A tuple or a list of additional special tokens.
     """
 
-    vocab_files_names = VOCAB_FILES_NAMES
-    pretrained_vocab_files_map = PRETRAINED_VOCAB_FILES_MAP
-    max_model_input_sizes = PRETRAINED_POSITIONAL_EMBEDDINGS_SIZES
+    vocab_files_names = {"vocab_file": "spiece.model"}
+    pretrained_vocab_files_map = {"vocab_file": {}}
+    max_model_input_sizes = {}
     model_input_names = ["input_ids", "attention_mask"]
 
     def __init__(self, vocab_file,
@@ -143,11 +135,16 @@ class SentencePieceTokenizer(PreTrainedTokenizer):
         self.model_proto = buf
         self.sp_model = spm.SentencePieceProcessor(model_proto=buf)
 
+    def get_name(self):
+        model_proto = model_pb2.ModelProto()
+        model_proto.ParseFromString(self.model_proto)
+        return os.path.split(model_proto.trainer_spec.model_prefix)[1]
+
     @property
     def vocab_size(self):
         return self.sp_model.get_piece_size()
 
-    def get_vocab(self) -> Dict[str, int]:
+    def get_vocab(self) -> typing.Dict[str, int]:
         return {self.convert_ids_to_tokens(i): i
             for i in range(self.vocab_size)}
 
@@ -176,12 +173,13 @@ class SentencePieceTokenizer(PreTrainedTokenizer):
         """Converts a sequence of tokens (string) in a single string."""
         return self.sp_model.decode(tokens)
 
-    def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple[str]:
+    def save_vocabulary(self, save_directory: str, filename_prefix: typing.Optional[str] = None) -> typing.Tuple[str]:
         if not os.path.isdir(save_directory):
             raise RuntimeWarning(f"Vocabulary path ({save_directory}) should be a directory")
             return
-        out_vocab_file = os.path.join(
-            save_directory, (filename_prefix + "-" if filename_prefix else "") + VOCAB_FILES_NAMES["vocab_file"]
+        out_vocab_file = os.path.join(save_directory, 
+            (filename_prefix + "-" if filename_prefix else "") +
+            self.vocab_files_names["vocab_file"]
         )
         open(out_vocab_file, 'wb').write(self.model_proto)
         return (out_vocab_file,)
@@ -224,10 +222,7 @@ class TrimmedSentencePieceTokenizer(SentencePieceTokenizer):
         level = 0
         while True:
             level += 1
-            try:
-                frame = sys._getframe(level)
-            except:
-                break
+            frame = sys._getframe(level)
             prnt = frame.f_locals
             if 'max_length' in prnt:
                 seq_len = prnt['max_length']
@@ -235,6 +230,8 @@ class TrimmedSentencePieceTokenizer(SentencePieceTokenizer):
         if seq_len is not None:
             trim = math.ceil(seq_len * self.avg_tok_len)
             text = text[:trim]
+        #else:
+        #    print(RuntimeWarning('max_length not set, may be slow'))
         return super().tokenize(text, **kwds)
 
 # make these available to AutoTokenizer.from_pretrained()
@@ -242,3 +239,87 @@ transformers.models.auto.tokenization_auto.NO_CONFIG_TOKENIZER += [
     SentencePieceTokenizer,
     TrimmedSentencePieceTokenizer,
 ]
+
+MAX_SENTENCE_LEN = 32 * 1024
+MAX_TOKEN_LEN = 64
+kUNKStr = "▅" # sentencepiece input text can not have this character
+
+def strim(text, size):
+    ''' truncate strings in the middle, but indicate how much was
+        cut out '''
+    if size <= 0:
+        text = ''
+    elif len(text) > size:
+        cut = len(text) - size + 2
+        cut += len(str(cut + len(str(cut))))
+        sep = f'…{cut}…'
+        if size >= len(sep) + 2:
+            off = (size - len(sep) + 1) // 2
+            text = text[:off] + sep + text[off+cut:]
+        else: # sep is too big, fallback to ellipse only
+            cut = len(text) - size + 1
+            off = size // 2
+            text = text[:off] + '…' + text[off+cut:]
+    return text
+
+def btrim(text, size):
+    # The max_sentence_length is in bytes.  Why didn't ya just make
+    # the buffer caller allocated, or hey, what about a std::string?
+    # You chose c++, not me, buddy. 😐
+    ssize = size
+    while True:
+        st = strim(text, ssize)
+        cut = len(bytes(st, 'utf8')) - size
+        if cut > 0:
+            ssize -= cut
+        else:
+            return st
+
+def train(vocab):
+    rx = r'\bcc-html([0-9]+)K(,su=f)?(,sn=f)?(,sw=f)?(,ws=t)?(,wo=t)?(,sd=t)?$'
+    m = re.search(rx, vocab)
+    if not m:
+        raise RuntimeError(f'"{vocab}" must match {rx}')
+    kwds = {}
+    size = int(m[1])
+    if m[2]: kwds['split_by_unicode_script'] = False
+    if m[3]: kwds['split_by_number'] = False
+    if m[4]: kwds['split_by_whitespace'] = False
+    if m[5]: kwds['treat_whitespace_as_suffix'] = True
+    if m[6]: kwds['allow_whitespace_only_pieces'] = True
+    if m[7]: kwds['split_digits'] = True
+    # TODO: use common path for getting at this sequence
+    ds = datasets.load_dataset('parquet',
+        data_files='cc-html.parquet',
+        columns=('html',),
+        split='train',
+    ).map(
+        lambda v: { 'text': btrim(v['html'], MAX_SENTENCE_LEN) },
+        remove_columns=('html',),
+    ).filter(lambda v: kUNKStr not in v['text'])
+    pathlib.Path(os.path.split(vocab)[0]).mkdir(parents=True, exist_ok=True)
+    spm.SentencePieceTrainer.train(
+        sentence_iterator=iter(ds['text']),
+        model_prefix=vocab,
+        vocab_size=size<<10,
+        max_sentence_length=MAX_SENTENCE_LEN,
+        max_sentencepiece_length=MAX_TOKEN_LEN,
+        num_threads=len(os.sched_getaffinity(0)),
+        control_symbols=('<pad>'),
+        user_defined_symbols=('<mask>'),
+        **kwds,
+    )
+
+def get(vocab_name):
+    ''' ask for a vocabulary by name, get a path useable in
+        transformers.AutoTokenizer.from_pretrained() '''
+    dst = f'model/spm/{vocab_name}'
+    model = f'{dst}.model'
+    if not os.path.exists(model):
+        train(dst)
+    if not os.path.exists(dst):
+        TrimmedSentencePieceTokenizer(model,
+            mask_token='<mask>',
+            pad_token='<pad>',
+        ).save_pretrained(dst)
+    return dst

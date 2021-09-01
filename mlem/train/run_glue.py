@@ -287,6 +287,7 @@ def main():
     # Labels
     if data_args.task_name is not None:
         is_regression = data_args.task_name == "stsb"
+        is_regression = datasets["train"].features["label"].dtype in ["float32", "float64"]
         if not is_regression:
             label_list = datasets["train"].features["label"].names
             num_labels = len(label_list)
@@ -376,18 +377,6 @@ def main():
     if label_to_id is not None:
         model.config.label2id = label_to_id
         model.config.id2label = {id: label for label, id in config.label2id.items()}
-    # -- ENTER PATCH
-    # the purpose of this patch is to make sure config.id2label and
-    # config.label2id get populated from a datasets.ClassLabel as
-    # directly as possible, please don't sort.
-    else:
-        from datasets import ClassLabel
-        lt = datasets['train'].features['label']
-        if isinstance(lt, ClassLabel):
-            d = dict(enumerate(lt.names))
-            model.config.id2label = d
-            model.config.label2id = { v: k for k, v in d.items() }
-    # -- LEAVE PATCH
 
     if data_args.max_seq_length > tokenizer.model_max_length:
         logger.warning(
@@ -413,6 +402,7 @@ def main():
         batched=True,
         load_from_cache_file=not data_args.overwrite_cache,
         desc="Running tokenizer on dataset",
+        num_proc=len(os.sched_getaffinity(0)),
     )
     if training_args.do_train:
         if "train" not in datasets:

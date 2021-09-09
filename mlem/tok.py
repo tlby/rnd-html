@@ -10,6 +10,7 @@ import sys
 import typing
 
 import datasets
+import packaging.version
 import sentencepiece as spm
 import sentencepiece.sentencepiece_model_pb2 as model_pb2
 import transformers
@@ -235,10 +236,18 @@ class TrimmedSentencePieceTokenizer(SentencePieceTokenizer):
         return super().tokenize(text, **kwds)
 
 # make these available to AutoTokenizer.from_pretrained()
-transformers.models.auto.tokenization_auto.NO_CONFIG_TOKENIZER += [
-    SentencePieceTokenizer,
-    TrimmedSentencePieceTokenizer,
-]
+if packaging.version.parse(transformers.__version__) < \
+        packaging.version.parse('4.10.0'): # Auto API refactor
+    transformers.models.auto.tokenization_auto.NO_CONFIG_TOKENIZER += [
+        SentencePieceTokenizer,
+        TrimmedSentencePieceTokenizer,
+    ]
+else:
+    transformers.models.auto.tokenization_auto.TOKENIZER_MAPPING_NAMES.update((
+        ("mlem", ('SentencePieceTokenizer', None)),
+        ("mlem", ('TrimmedSentencePieceTokenizer', None)),
+    ))
+    sys.modules['transformers.models.mlem'] = sys.modules[__name__]
 
 MAX_SENTENCE_LEN = 32 * 1024
 MAX_TOKEN_LEN = 64

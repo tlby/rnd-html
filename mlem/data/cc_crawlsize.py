@@ -13,9 +13,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.fs as pf
 import pyarrow.parquet as pq
-import s3fs
 import tqdm
-import warcio
 
 def pull_ccidx(src):
     for p in src:
@@ -56,19 +54,14 @@ def ccidx_fold(src):
     yield from blk[0].values()
 
 def warc_init(func):
-    func.awrl = warcio.recordloader.ArcWarcRecordLoader()
-    func.fs = s3fs.S3FileSystem(anon=True)
+    func.cc = util.CommonCrawl()
 
 def warc_load(item):
     # there might be more than one warc entry, but we'll just take the
     # first right now and assume the others are basically near dups
     host, count, row = item[:3]
-    rec = warc_load.awrl.parse_record_stream(
-        warcio.bufferedreaders.DecompressingBufferedReader(io.BytesIO(
-            warc_load.fs.read_block(
-                fn=f'commoncrawl/{row["warc_filename"]}',
-                offset=row['warc_record_offset'],
-                length=row['warc_record_length']))))
+    rec = warc_load.cc.load(fn=row['warc_filename'],
+        offset=row['warc_record_offset'], length=row['warc_record_length'])
     body = rec.content_stream().read()
     if util.seems_like_html(body):
         body = util.body_text(rec, body)

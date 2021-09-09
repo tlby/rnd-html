@@ -1,12 +1,15 @@
 
 import cgi
 import codecs
+import io
 import sys
 
 import html5prescan
 import pyarrow as pa
 import pyarrow.parquet as pq
+import s3fs
 import sniffpy
+import warcio
 
 def toParquet(dst, src, schema, compression='GZIP', **kwds):
     def bundle(src):
@@ -114,3 +117,14 @@ def body_text(rec, src):
             rec.http_headers.get('content-type') if rec.http_headers else None,
         )))
     return win[0].rstrip("\0")
+
+class CommonCrawl:
+    def __init__(self, base='commoncrawl'):
+        self.base = base
+        self.awrl = warcio.recordloader.ArcWarcRecordLoader()
+        self.fs = s3fs.S3FileSystem(anon=True)
+    def load(self, fn, offset, length):
+        return self.awrl.parse_record_stream(
+            warcio.bufferedreaders.DecompressingBufferedReader(io.BytesIO(
+                self.fs.read_block(fn=f'{self.base}/{fn}', offset=offset,
+                    length=length))))

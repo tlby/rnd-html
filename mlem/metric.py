@@ -19,7 +19,8 @@ def mcc(cm):
     cov_yy = numpy.sum(y * (n - y))
     i = cm.diagonal()
     cov_xy = numpy.sum(i * n - x * y)
-    return cov_xy * (cov_xx * cov_yy) ** -0.5
+    den = cov_xx * cov_yy
+    return cov_xy * den ** -0.5 if den > 0 else 0
 
 
 class ClassificationMetric(datasets.Metric):

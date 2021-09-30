@@ -6,6 +6,8 @@ html5prescan
 sniffpy
 sentencepiece
 torch
+scipy
+sklearn
 datasets>=1.9 # need huggingface/datasets#2453 for run_mlm.py use of `column_names[0]`
 transformers
 protobuf
@@ -13,3 +15,4 @@ pycryptodome
 markdown
 altair
 s3fs
+ray[default,tune]

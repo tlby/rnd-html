@@ -33,6 +33,10 @@ class ClassificationMetric(datasets.Metric):
                 'references': datasets.Value('int32'),
             }),
         )
+    # this is non-standard, but if I try to call it with dummy values
+    # before a fork the parent class gets super mad
+    def outputs(self):
+        return ('acc', 'mcc', 'rpb')#, 'cm')
     def _compute(self, predictions, references, axis=-1):
         preds = numpy.array(predictions)
         N = preds.shape[axis]

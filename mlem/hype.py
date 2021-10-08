@@ -1,7 +1,15 @@
 
+import contextlib
+import itertools
 import json
 import os
+import shutil
+import sys
+import traceback
+import typing
 
+import datasets
+import numpy
 import ray.tune
 import transformers
 
@@ -54,7 +62,7 @@ class TailScheduler(ray.tune.schedulers.trial_scheduler.FIFOScheduler):
         return trial
 
 class StopOutliersScheduler(TailScheduler):
-    def __init__(self, time_attr, metric, mode, conf=0.15, **kwds):
+    def __init__(self, time_attr, metric=None, mode=None, conf=0.15, **kwds):
         self._time_attr = time_attr
         self._metric = metric
         self._mode = mode
@@ -62,6 +70,16 @@ class StopOutliersScheduler(TailScheduler):
         self._stat = {}
         self.stop_times = []
         super().__init__(time_attr=time_attr, **kwds)
+    def set_search_properties(self, metric, mode):
+        if metric:
+            if self._metric:
+                return
+            self._metric = metric
+        if mode:
+            if self._mode:
+                return
+            self._mode = mode
+        return True
     def on_trial_add(self, trial_runner, trial):
         self._stat[trial.trial_id] = []
     def on_trial_error(self, trial_runner, trial):
@@ -110,132 +128,193 @@ class StopOutliersScheduler(TailScheduler):
                 p = 1 - p
         return p
 
-def default_space():
+def default_grid():
+    return {
+        'vocab': [
+            #'cc-html8K',                # bert/mini,N=512/sphtml8K eval_loss=5.300
+            'cc-html8K,sd=t',           # bert/mini,N=512/sphtml8K eval_loss=4.408
+            #'cc-html8K,sn=f',           # bert/mini,N=512/sphtml8K eval_loss=5.342
+            #'cc-html8K,sn=f,sw=f',      # bert/mini,N=512/sphtml8K eval_loss=5.437
+            #'cc-html8K,sn=f,ws=t',      # bert/mini,N=512/sphtml8K eval_loss=5.417
+            #'cc-html8K,su=f',           # bert/mini,N=512/sphtml8K eval_loss=5.912
+            #'cc-html8K,su=f,sn=f',      # bert/mini,N=512/sphtml8K eval_loss=5.912
+            #'cc-html8K,su=f,sw=f',      # bert/mini,N=512/sphtml8K eval_loss=5.878
+            #'cc-html8K,sw=f',           # bert/mini,N=512/sphtml8K eval_loss=5.208
+            #'cc-html8K,sw=f,sd=t',      # bert/mini,N=512/sphtml8K eval_loss=4.536
+            #'cc-html8K,sw=f,ws=t',      # bert/mini,N=512/sphtml8K eval_loss=5.319
+            #'cc-html8K,sw=f,ws=t,sd=t', # bert/mini,N=512/sphtml8K eval_loss=4.349
+            #'cc-html8K,ws=t',           # bert/mini,N=512/sphtml8K eval_loss=5.359
+        ],
+        'model_type': [
+            #'albert',        #tiny,N=2048/sphtml8K,sn=f eval_loss=5.670,
+            'bert',          #tiny,N=2048/sphtml8K,sn=f eval_loss=5.677,
+            #'big_bird',      #tiny,N=2048/sphtml8K,sn=f eval_loss=5.528,
+            'convbert',      #tiny,N=2048/sphtml8K,sn=f eval_loss=3.203,
+            #'deberta',       #tiny,N=2048/sphtml8K,sn=f eval_loss=5.681,
+            #'deberta-v2',    #tiny,N=2048/sphtml8K,sn=f eval_loss=5.700,
+            #'electra',       #tiny,N=2048/sphtml8K,sn=f eval_loss=5.690,
+            #'layoutlm',      #tiny,N=2048/sphtml8K,sn=f eval_loss=5.673,
+            #'megatron-bert', #tiny,N=2048/sphtml8K,sn=f eval_loss=5.464,
+            'roformer',      #tiny,N=2048/sphtml8K,sn=f eval_loss=3.759,
+        ],
+        'model_size': [
+            # each item is roughly half the speed of the previous
+            'tiny',
+            #'mini',
+            #'small',
+            #'medium',
+        ],
+        'max_len': [
+            # linear speed decay
+            #64, # just for smoke tests really
+            #128,
+            512,
+            #2048,
+        ],
+    }
+
+def default_hp_space():
+    dflt = transformers.TrainingArguments
     space = {}
-    n_trials = 1
+    samples = 1
+    if True:
+        space['learning_rate'] = ray.tune.loguniform(
+            dflt.learning_rate / 4,
+            dflt.learning_rate * 4,
+            base=4)
+        samples *= 2
+    if True:
+        space['weight_decay'] = ray.tune.sample_from(lambda _: (
+            numpy.random.gamma(0.125, 0.125)
+        ))
+        samples *= 2
+    return samples, space
 
-    # architecture search params
-    space['vocab'] = 'cc-html8K,sd=t'
-    space['model_type'] = ray.tune.grid_search([
-        #'albert',        #tiny,N=2048/sphtml8K,sn=f eval_loss=5.670,
-        'bert',          #tiny,N=2048/sphtml8K,sn=f eval_loss=5.677,
-        #'big_bird',      #tiny,N=2048/sphtml8K,sn=f eval_loss=5.528,
-        'convbert',      #tiny,N=2048/sphtml8K,sn=f eval_loss=3.203,
-        #'deberta',       #tiny,N=2048/sphtml8K,sn=f eval_loss=5.681,
-        #'deberta-v2',    #tiny,N=2048/sphtml8K,sn=f eval_loss=5.700,
-        #'electra',       #tiny,N=2048/sphtml8K,sn=f eval_loss=5.690,
-        #'layoutlm',      #tiny,N=2048/sphtml8K,sn=f eval_loss=5.673,
-        #'megatron-bert', #tiny,N=2048/sphtml8K,sn=f eval_loss=5.464,
-        'roformer',      #tiny,N=2048/sphtml8K,sn=f eval_loss=3.759,
-    ])
-    space['model_size'] = 'tiny'
-    space['max_len'] = 64
-
-    # traditional hyperparam search
-    #space['learning_rate'] = ray.tune.loguniform(
-    #    5e-05 / 4,
-    #    5e-05 * 4,
-    #    base=4)
-    #n_trials *= 2 # two tries for learning rate
-
-    # bookkeeping junk
-    space['plan_id'] = ray.tune.randint(111111, 999999)
-
-    return n_trials, space
-
-class FakeModel:
-    def to(self, device):
-        pass
-
-def hype(name, data, space=default_space, **kwds):
-    dsd = data()
-    pwd = os.getcwd()
-    trainer = None
-    id2label = dict(enumerate(dsd['train'].features['label'].names))
-    def model_init(plan):
-        cwd = os.getcwd()
-        os.chdir(pwd)
-        if plan is None:
-            # Trainer() calls model_init(None) but never does anything
-            # meaningful with the result
-            return FakeModel()
-        src = train.pretrain(
-            vocab=plan['vocab'],
-            arch=plan['model_type'],
-            size=plan['model_size'],
-        )
-        max_len = plan['max_len']
-        tokenizer = transformers.AutoTokenizer.from_pretrained(src, model_max_length=max_len)
-        model = transformers.AutoModelForSequenceClassification.from_pretrained(src, id2label=id2label)
-        assert(tokenizer.model_max_length == max_len)
-        os.chdir(cwd)
-        # now that the tokenizer has been chosen, we should reconfigure
-        # the trainer a bit
-        tdsd = dsd.map(lambda batch: tokenizer(batch['sentence'],
-            max_length=max_len, truncation=True), batched=True,
-            desc='tokenize data')
-        trainer.train_dataset = tdsd['train']
-        trainer.eval_dataset = tdsd['validation']
-        trainer.tokenizer = tokenizer
-        trainer.data_collator = transformers.data.data_collator.DataCollatorWithPadding(tokenizer)
-        trainer.args.output_dir = f'{trainer.args.output_dir}/{plan["plan_id"]}'
-        return model
-    mcls = metric.ClassificationMetric
-    m = mcls()
-    epochs = 2.0
-    batch_size = 60
-    eval_steps = int(len(dsd['train']) * epochs / batch_size / 16)
-    class TrainObserver(transformers.TrainerCallback):
-        def on_train_end(self, args, state, control, **kwds):
-            trainer.save_model(args.output_dir)
-    trainer = transformers.Trainer(
-        model_init=model_init,
-        args=transformers.TrainingArguments(
-            output_dir=f'{pwd}/ray/trial', # notused?
-            do_train=True,
-            do_eval=True,
-            evaluation_strategy='steps',
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            num_train_epochs=epochs,
-            eval_steps=eval_steps,
-
-            disable_tqdm=True,
-            seed=54321,
-        ),
-        compute_metrics=lambda eval_pred: m.compute(
+def build_trainer(args, model, vocab, metric, data):
+    ''' Just the barebones basics here '''
+    def compute_metrics(eval_pred):
+        return metric.compute(
             predictions=eval_pred[0],
             references=eval_pred[1],
-        ),
-        # we have to provide values for these, but will replace them in
-        # model_init() once the tokenizer has been chosen
-        tokenizer=False,
-        data_collator=False,
-        train_dataset=dsd['train'],
-        eval_dataset=dsd['validation'],
-        callbacks=[TrainObserver],
+        )
+    return transformers.Trainer(
+        model=model,
+        args=args,
+        tokenizer=vocab,
+        compute_metrics=compute_metrics,
+        train_dataset=data['train'],
+        eval_dataset=data['validation'],
     )
-    n_trials, config = space()
-    metric_columns = [ f'eval_{k}' for k in mcls().compute(
-        predictions=[[0]], references=[0]).keys() ]
-    best = trainer.hyperparameter_search(
-        compute_objective=lambda m: m['eval_loss'],
-        direction='minimize',
-        backend='ray',
+
+def prep_trainer_for_ray(trainer, eval_freq):
+    class TrainObserver(transformers.TrainerCallback):
+        def __init__(self):
+            self.last_eval = 0
+            super().__init__()
+        def on_train_begin(self, args, state, control, **kwds):
+            args.output_dir = os.path.join(
+                args.output_dir, ray.tune.get_trial_id())
+        def on_step_end(self, args, state, control, **kwds):
+            # don't use modular arithmetic here because epoch is a float
+            # and the eval_freq might not divide the step count evenly
+            pos = int(eval_freq * state.epoch)
+            if pos > self.last_eval or state.global_step == state.max_steps:
+                self.last_eval = pos
+                control.should_evaluate = True
+                control.should_save = True
+        def on_evaluate(self, args, state, control, metrics, **kwds):
+            # ray.tune needs the eval metrics as they come in
+            ray.tune.report(**metrics)
+        def on_save(self, args, state, control, **kwds):
+            # ray.tune wants to manage the checkpoints
+            cpd = transformers.trainer.PREFIX_CHECKPOINT_DIR
+            src = os.path.join(args.output_dir, f'{cpd}-{state.global_step}')
+            with ray.tune.checkpoint_dir(step=state.global_step) as dst:
+                for ent in os.listdir(src):
+                    shutil.move(os.path.join(src, ent), os.path.join(dst, ent))
+            os.rmdir(src)
+            # this checkpoint should have been the only entry
+            os.rmdir(args.output_dir)
+    trainer.add_callback(TrainObserver())
+    return trainer
+
+def hype(name, data, output_dir,
+        grid=default_grid,
+        space=default_hp_space,
+        epochs=1.0,
+        batch_size=60,
+        eval_freq=8):
+    output_dir = os.path.abspath(output_dir)
+    data = data()
+    id2label = dict(enumerate(data['train'].features['label'].names))
+    met = metric.ClassificationMetric()
+    grid = grid()
+    keys = grid.keys()
+    trainers = {}
+    models = []
+    for p in itertools.product(*grid.values()):
+        d = dict(zip(keys, p))
+        src = train.pretrain(**d)
+        m_type, m_size, m_voc = src.split('/')[-3:]
+        key = '/'.join((m_type, m_size, m_voc))
+        cfg = transformers.AutoConfig.from_pretrained(src)
+        vocab = transformers.AutoTokenizer.from_pretrained(tok.get(m_voc),
+            model_max_length=cfg.max_model_length)
+        trainers[key] = prep_trainer_for_ray(build_trainer(
+            args=transformers.TrainingArguments(
+                output_dir=output_dir,
+                seed=54321,
+                disable_tqdm=True,
+                num_train_epochs=epochs,
+            ),
+            model=transformers.AutoModelForSequenceClassification.from_pretrained(
+                src, id2label=id2label),
+            vocab=vocab,
+            metric=met,
+            data=data.map(
+                lambda batch: vocab(batch['sentence'], truncation=True),
+                batched=True,
+                desc='tokenize',
+                num_proc=len(os.sched_getaffinity(0)),
+            )
+        ), eval_freq)
+        models.append(key)
+    def trainable(trial, checkpoint_dir=None):
+        trial = trial.copy()
+        src = trial.pop('model')
+        trainer = trainers[src]
+        args = trainer.args
+        # the rest of the trial settings go to training args
+        for k, v in trial.items():
+            #prev = getattr(args, k)
+            #if prev is not None and type(prev) != type(v):
+            #    raise RuntimeError(f'key={k} old={type(prev)} new={type(v)}')
+            setattr(args, k, v)
+        # autoscale magic might work?
+        def adapt(batch_size, gradient_accumulation_steps):
+            trainer.args.per_device_train_batch_size = batch_size
+            trainer.args.per_device_eval_batch_size = batch_size
+            trainer.args.gradient_accumulation_steps = gradient_accumulation_steps
+            trainer.train(resume_from_checkpoint=checkpoint_dir)
+        train.batch_size_autoscale(adapt, batch_size)
+        # no need to save here because ray has a final checkpoint
+
+    samples, space = space()
+    config = dict(space, model=ray.tune.grid_search(models))
+    analysis = ray.tune.run(
+        trainable,
+        metric='eval_loss',
+        mode='min',
+        name=name,
+        config=config,
+        num_samples=samples,
+        local_dir=os.path.abspath(os.path.join(output_dir, 'trials')),
+        keep_checkpoints_num=1,
+        progress_reporter=ray.tune.CLIReporter(metric_columns=[ 'epoch' ] + [
+            f'eval_{k}' for k in met.outputs()
+        ]),
         scheduler=StopOutliersScheduler(
             time_attr='epoch',
-            metric='objective',
-            mode='min',
         ),
-        hp_space=lambda _: config,
-        progress_reporter=ray.tune.CLIReporter(
-            metric_columns=['epoch']+metric_columns,
-        ),
-        n_trials=n_trials,
-        keep_checkpoints_num=1,
-        local_dir=f'{pwd}/ray/trials',
     )
-    # tidy up the mess
-    # pass back path of winner after cleanup
-    dst = f'{trainer.args.output_dir}/{best.hyperparameters["plan_id"]}'
-    return dst, best.hyperparameters
+    return analysis.best_trial.checkpoint.value, analysis

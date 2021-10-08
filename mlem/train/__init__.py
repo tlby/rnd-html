@@ -95,17 +95,21 @@ def parse_size(name):
         return (int(m[1]), int(m[2]))
     raise RuntimeError(f'size "{size}" not understood')
 
-def config(vocab, arch='bert', size='tiny', max_len=512):
-    layers, hidden = parse_size(size)
-    dst = '/'.join((
+def config(vocab, model_type='bert', model_size='tiny', max_len=64):
+    layers, hidden = parse_size(model_size)
+    path = (
         'model/cfg',
-        arch,
+        model_type,
         f'L={layers},H={hidden},N={max_len}',
         vocab.get_name(),
-    ))
+    )
+    try:
+        dst = '/'.join(path)
+    except:
+        raise RuntimeError(f'ugh: {path}')
     if os.path.exists(f'{dst}/config.json'):
         return dst
-    cls = transformers.CONFIG_MAPPING[arch]
+    cls = transformers.CONFIG_MAPPING[model_type]
     cls(
         vocab_size=vocab.vocab_size,
         hidden_size=hidden,
@@ -160,7 +164,7 @@ def pretrain(vocab, **kwds):
             '--output_dir', dst,
             '--num_train_epochs=1',
             '--max_train_samples', str(60 * 10240),
-            '--max_eval_samples', str(60 * 512),
+            '--max_eval_samples', str(60 * 640),
         ))
     drop_checkpoints(dst)
     return dst

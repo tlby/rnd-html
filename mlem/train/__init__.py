@@ -1,5 +1,6 @@
 
 import concurrent.futures
+import gc
 import glob
 import inspect
 import math
@@ -8,217 +9,352 @@ import re
 import shutil
 import sys
 import tempfile
+import weakref
 
 import datasets
+import torch
 import transformers
 
 from .. import tok
 from .. import metric
-from . import run_mlm
-from . import run_glue
 
-def drop_checkpoints(path):
-    for chkp in glob.glob(path + '/checkpoint-*'):
-        shutil.rmtree(chkp)
+def _auto_split(ds):
+    sp = ds.train_test_split(1/8)
+    ds_train = sp['train'].flatten_indices()
+    sp = sp['test'].train_test_split(1/2)
+    ds_guide = sp['train'].flatten_indices()
+    ds_proof = sp['test'].flatten_indices()
+    return datasets.DatasetDict({
+        'train': ds_train,
+        'validation': ds_guide,
+        'test': ds_proof,
+    })
 
-def batch_size_autoscale(code, batch_size=60):
+def _tidy(path):
+    shutil.rmtree(path)
+    # prune any empty parent directories
+    try:
+        while True:
+            path, _ = os.path.split(path)
+            if path == '':
+                break
+            os.rmdir(path)
+    except OSError: # directory not empty, we're done
+        pass
+
+class BatchAutoScaleTrainer(transformers.Trainer):
     ''' Try to detect application crashes due to CUDA/CPU OOMs and
         rescale batch size.  An antiprime batch_size gives best results.
         Inspired by PyTorchLightning/pytorch-lightning#1638
     '''
-    # don't ask CUDA or fork children will not get to use CUDA
-    cores = max(len(glob.glob('/proc/driver/nvidia/gpus/*')), 1)
-    per_core = batch_size // cores
-    if per_core * cores != batch_size:
-        raise RuntimeError(
-            f'batch_size ({batch_size}) must divide cores ({cores}) evenly')
-    # schedule from largest to smallest batch_size, with a
-    # compensating gradient_accumulation_steps value for each
-    n = math.floor(math.sqrt(per_core))
-    fits = []
-    for i in range(n, 0, -1):
-        j = per_core // i
-        if j * i != per_core:
-            continue
-        fits.insert(0, (j, i))
-        if j != i:
-            fits.append((i, j))
-    # try the schedules until one doesn't crash
-    for i, j in fits:
-        try:
-            return code(batch_size=i, gradient_accumulation_steps=j)
-        except concurrent.futures.process.BrokenProcessPool:
-            continue # likely OOM Killer on CPU memory, retry
-        except RuntimeError as err:
-            # shamelessly stolen from https://github.com/PyTorchLightning/pytorch-lightning/pull/1638/files#diff-5200c11792b86d6a07ea64820e126897aa2e3b7d3d295c92c19b141de6950afeR29-R32
-            if len(err.args) == 1 and (
-                    "CUDA out of memory." in err.args[0] or
-                    "cuDNN error: CUDNN_STATUS_NOT_SUPPORTED." in err.args[0] or
-                    # adding this error to the retry list seems to have
-                    # caused a kernel panic
-                    #"CUDA error: CUBLAS_STATUS_ALLOC_FAILED " in err.args[0] or
-                    "DefaultCPUAllocator: can't allocate memory" in err.args[0]):
-                continue # likely GPU memory fail, retry
-            raise
-    raise RuntimeError("unable to find a workable batch_size")
-
-def run_direct(args):
-    # why not subprocess.run here?  Because we want to recover the error
-    # object on failure, plus we want to shim some alterations into
-    # certain scripts before running.
-    func = args[0]
-    sys.argv = [ func.__module__ + '.py' ] + list(args[1:])
-    return func()
-
-def train(*args):
-    # this is for crash isolation, not parallelism
-    with concurrent.futures.ProcessPoolExecutor(max_workers=1) as exe:
-        return exe.submit(run_direct, args).result()
+    def _shrink_bs(self):
+        # GAS is used by both .train() and .eval() and we need to find a
+        # suitable setting for both
+        tbs = self.args.per_device_train_batch_size
+        ebs = self.args.per_device_eval_batch_size
+        gas = self.args.gradient_accumulation_steps
+        for i in range(gas + 1, min(tbs, ebs) + 1):
+            if tbs % i or ebs % i:
+                continue
+            self.args.per_device_train_batch_size = (tbs * gas) // i
+            self.args.per_device_eval_batch_size = (ebs * gas) // i
+            self.args.gradient_accumulation_steps = i
+            return True
+        return False
+    def _is_oom(self, err):
+        # shamelessly stolen from https://github.com/PyTorchLightning/pytorch-lightning/pull/1638/files#diff-5200c11792b86d6a07ea64820e126897aa2e3b7d3d295c92c19b141de6950afeR29-R32
+        return len(err.args) == 1 and (
+            "CUDA out of memory." in err.args[0]
+         or "cuDNN error: CUDNN_STATUS_NOT_SUPPORTED." in err.args[0]
+         or "DefaultCPUAllocator: can't allocate memory" in err.args[0]
+         or "CUDA error: CUBLAS_STATUS_ALLOC_FAILED " in err.args[0]
+        )
+    def _auto_scale_batch_size(self, code):
+        while True:
+            try:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return code()
+            except RuntimeError as err:
+                if self._is_oom(err) and self._shrink_bs():
+                    continue
+                raise
+            assert(False) # bug in _shrink_bs() most likely
+    def train(self, *args, **kwds):
+        train = super().train
+        return self._auto_scale_batch_size(
+            lambda: train(*args, **kwds))
+    def evaluate(self, *args, **kwds):
+        evaluate = super().evaluate
+        return self._auto_scale_batch_size(
+            lambda: evaluate(*args, **kwds))
 
 def get_defaults(func):
     return { k: v.default
         for k, v in inspect.signature(func).parameters.items()
         if v.default is not inspect.Parameter.empty }
 
-def parse_size(name):
-    names = {
-        'tiny': (2, 128),
-        'mini': (4, 256),
-        'small': (4, 512),
-        'medium': (8, 512),
-    }
-    if name in names:
-        return names[name]
-    rx = r'^L=([0-9]+),H=([0-9]+)$'
-    m = re.match(rx, name)
-    if m:
-        return (int(m[1]), int(m[2]))
-    raise RuntimeError(f'size "{size}" not understood')
-
-def config(vocab, model_type='bert', model_size='tiny', max_len=64):
-    layers, hidden = parse_size(model_size)
-    path = (
-        'model/cfg',
-        model_type,
-        f'L={layers},H={hidden},N={max_len}',
-        vocab.get_name(),
-    )
+def final_save(trainer):
+    state = trainer.state
+    args = trainer.args
+    trainer.save_model()
+    # fetch the final train metrics
+    (train_metrics,) = filter(
+        lambda log: (log['step'] == state.global_step
+            and 'train_loss' in log), state.log_history)
+    trainer.save_metrics("train", train_metrics)
     try:
-        dst = '/'.join(path)
-    except:
-        raise RuntimeError(f'ugh: {path}')
-    if os.path.exists(f'{dst}/config.json'):
-        return dst
+        # fetch the final eval metrics
+        (eval_metrics,) = filter(
+            lambda log: (log['step'] == state.global_step
+                and 'eval_loss' in log), state.log_history)
+    except ValueError:
+        # generate one if necessary
+        trainer.evaluate()
+        (eval_metrics,) = filter(
+            lambda log: (log['step'] == state.global_step
+                and 'eval_loss' in log), state.log_history)
+    trainer.save_metrics("eval", eval_metrics)
+    # and save the final trainer_state
+    trainer.save_state()
+    # with that done we can tidy up the training artifacts
+    for ckp in trainer._sorted_checkpoints(output_dir=args.output_dir):
+        _tidy(ckp)
+    _tidy(args.logging_dir) # tensorboard cruft?
+
+MODEL_CACHE_DIR = './model'
+def model_path(task, vocab, model_type, model_size, max_len):
+    size_names = {
+        'tiny':   ( 2,  128),
+        'mini':   ( 4,  256),
+        'small':  ( 4,  512),
+        'medium': ( 8,  512),
+        'base':   (12,  768),
+        'large':  (24, 1024),
+    }
+    if model_size in size_names:
+        layers, hidden = size_names[model_size]
+    else:
+        m = re.match(r'^L=([0-9]+),H=([0-9]+)$', name)
+        if m:
+            layers, hidden = int(m[1]), int(m[2])
+        else:
+            raise RuntimeError(f'model_size "{model_size}" not understood')
+    return os.path.join(
+        MODEL_CACHE_DIR, task, model_type,
+        f'L={layers},H={hidden},N={max_len}',
+        vocab)
+
+def _cfg(voc, model_type, model_size, max_len):
     cls = transformers.CONFIG_MAPPING[model_type]
-    cls(
-        vocab_size=vocab.vocab_size,
+    size_names = {
+        'tiny':   ( 2,  128),
+        'mini':   ( 4,  256),
+        'small':  ( 4,  512),
+        'medium': ( 8,  512),
+        'base':   (12,  768),
+        'large':  (24, 1024),
+    }
+    if model_size in size_names:
+        layers, hidden = size_names[model_size]
+    else:
+        m = re.match(r'^L=([0-9]+),H=([0-9]+)$', model_size)
+        if m:
+            layers, hidden = int(m[1]), int(m[2])
+        else:
+            raise RuntimeError(f'model_size "{model_size}" not understood')
+    mpe = get_defaults(cls.__init__).get('max_position_embeddings', 0)
+    return cls(
+        vocab_size=voc.vocab_size,
         hidden_size=hidden,
         num_hidden_layers=layers,
         num_attention_heads=hidden // 64,
         intermediate_size=hidden * 4,
-        mask_token=vocab.mask_token,
+        mask_token=voc.mask_token,
         max_model_length=max_len,
         # only extend this one if we must
-        max_position_embeddings=max(
-            get_defaults(cls.__init__).get('max_position_embeddings', 0),
-            max_len)
-    ).save_pretrained(dst)
-    return dst
+        max_position_embeddings=max(mpe, max_len),
+    )
 
-def cc_html_loader(dataset_name, dataset_config_name, **kwds):
+def _lm_data(tokenizer, num_proc):
     from ..data import cc_html
     return datasets.load_dataset('parquet',
         data_files=cc_html.get(),
         columns=('html',),
-        **kwds,
-    ).rename_column('html', 'text')
+    ).shuffle().map(
+        lambda batch: tokenizer(batch['html']),
+        batched=True,
+        batch_size=256,
+        num_proc=num_proc,
+        remove_columns=('html',),
+        desc='tokenize',
+    )
 
-def pretrain(vocab, **kwds):
-    voc = transformers.AutoTokenizer.from_pretrained(tok.get(vocab))
-    path = config(vocab=voc, **kwds)
-    cfg = transformers.AutoConfig.from_pretrained(path)
-    dst = '/'.join((
-        'model/mlm', cfg.model_type,
-        'L={num_hidden_layers},H={hidden_size},N={max_model_length}'.format(
-            **vars(cfg)), voc.get_name(),
-    ))
-    if os.path.exists(f'{dst}/config.json'):
-        return dst
-    # quick little patch to sidestep run_mlm command line arg limitations
-    run_mlm.load_dataset = cc_html_loader
-    batch_size_autoscale(lambda batch_size, gradient_accumulation_steps:
-        train(run_mlm.main,
-            '--preprocessing_num_workers', str(len(os.sched_getaffinity(0))),
-            '--seed=54321',
-            '--dataset_name=noop',
-            '--dataset_config_name=noop',
-            '--do_train',
-            '--do_eval',
-            '--per_device_train_batch_size', str(batch_size),
-            '--per_device_eval_batch_size', str(batch_size),
-            '--gradient_accumulation_steps', str(gradient_accumulation_steps),
-            '--max_seq_length', str(cfg.max_model_length),
-            '--model_type', cfg.model_type,
-            '--config_name', path,
-            '--tokenizer_name', voc.name_or_path,
-            '--output_dir', dst,
-            '--num_train_epochs=1',
-            '--max_train_samples', str(60 * 10240),
-            '--max_eval_samples', str(60 * 640),
-        ))
-    drop_checkpoints(dst)
+def lm_trainer(dst, task_cls, **kwds):
+    voc_src = tok.get(kwds.pop('vocab'))
+    voc = transformers.AutoTokenizer.from_pretrained(voc_src)
+    # this tokenizer for pretraining does not pin max_len, but the one
+    # set on the trainer for use downstream will.
+    cfg = _cfg(voc=voc, **kwds)
+    args = transformers.TrainingArguments(
+        output_dir=dst,
+        do_train=True,
+        per_device_train_batch_size=60,
+        per_device_eval_batch_size=60,
+        #num_train_epochs=1.0,
+        max_steps=16384,
+        seed=54321,
+
+        evaluation_strategy='steps',
+        eval_steps=500,
+        logging_strategy='steps',
+        logging_steps=500,
+        save_strategy='steps',
+        save_steps=500,
+        save_total_limit=1,
+    )
+    # set the seed early
+    transformers.set_seed(args.seed)
+    block_size = cfg.max_model_length
+    def group_texts(examples):
+        # Concatenate all texts.
+        concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+        # customize this part to your needs.
+        if total_length >= block_size:
+            total_length = (total_length // block_size) * block_size
+        # Split by chunks of max_len.
+        result = {
+            k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
+            for k, t in concatenated_examples.items()
+        }
+        result["labels"] = result["input_ids"].copy()
+        return result
+    num_proc = len(os.sched_getaffinity(0))
+    data = _lm_data(voc, num_proc).map(
+        group_texts,
+        batched=True,
+        batch_size=256,
+        num_proc=num_proc,
+        desc='group texts',
+    )
+    data = data['train'].train_test_split(4096)
+    trainer = BatchAutoScaleTrainer(
+        args=args,
+        model=task_cls.from_config(cfg),
+        # max_len should be set on the tokenizer for downstream users of
+        # this pretraining, so we save a slightly modified version
+        tokenizer=transformers.AutoTokenizer.from_pretrained(
+            voc_src,
+            model_max_length=cfg.max_model_length,
+        ),
+        train_dataset=data['train'],
+        eval_dataset=data['test'],
+        data_collator=transformers.default_data_collator,
+    )
+    return trainer
+
+def pretrain(**kwds):
+    dst = model_path(task='mlm', **kwds)
+    if not os.path.exists(f'{dst}/config.json'):
+        trainer = lm_trainer(dst, task_cls=transformers.AutoModelForMaskedLM, **kwds)
+        last_checkpoint = transformers.trainer_utils.get_last_checkpoint(dst)
+        n_params = sum(dict((p.data_ptr(), p.numel()) for p in trainer.model.parameters()).values())
+        transformers.trainer.logger.info(
+            'Training new %.3fM parameter model from scratch %s' % (
+                n_params / 1000000, dst))
+        trainer.train(resume_from_checkpoint=last_checkpoint)
+        final_save(trainer)
     return dst
 
-def patch_finetune(mod, data):
-    # TODO: stop hot patching things
-    # huggingface/transformers publishes example training scripts.  They
-    # are getting more configurable with each release.  It's now at the
-    # point that I don't have to edit the script to run our finetuning
-    # task, but I _do_ have to hot patch in a few changes.
-    mod.task_to_keys['task'] = ('sentence', None)
-    # force feed dataset into load_dataset('glue', ...)
-    mod.load_dataset = data
-    # no-op load_metric() because we're going to replace
-    # compute_metrics() anyway
-    mod.load_metric = lambda *args, **kwds: None
+def pretrain_clm(**kwds):
+    dst = model_path(task='clm', **kwds)
+    if not os.path.exists(f'{dst}/config.json'):
+        trainer = lm_trainer(dst, task_cls=transformers.AutoModelForCausalLM, **kwds)
+        last_checkpoint = transformers.trainer_utils.get_last_checkpoint(dst)
+        n_params = sum(dict((p.data_ptr(), p.numel()) for p in trainer.model.parameters()).values())
+        transformers.trainer.logger.info(
+            'Training new %.3fM parameter model from scratch %s' % (
+                n_params / 1000000, dst))
+        trainer.train(resume_from_checkpoint=last_checkpoint)
+        final_save(trainer)
+    return dst
+
+def finetune_trainer(task, data, src, **kwds):
+    cfg = transformers.AutoConfig.from_pretrained(src)
+    voc = transformers.AutoTokenizer.from_pretrained(src,
+        model_max_length=cfg.max_model_length)
+    # reloading the vocab from the original source to better utilize the
+    # datasets cache
+    voc = transformers.AutoTokenizer.from_pretrained(tok.get(voc.get_name()),
+        model_max_length=cfg.max_model_length)
+    cores = max(1, transformers.TrainingArguments('.').n_gpu)
+    args = dict(
+        do_train=True,
+        per_device_train_batch_size=60 // cores,
+        per_device_eval_batch_size=60 // cores,
+        num_train_epochs=4.0,
+        seed=54321,
+
+        evaluation_strategy='steps',
+        eval_steps=500,
+        logging_strategy='steps',
+        logging_steps=500,
+        save_strategy='steps',
+        save_steps=500,
+        save_total_limit=1,
+    )
+    args.update(**kwds)
+    args = transformers.TrainingArguments(**args)
+    transformers.set_seed(args.seed)
+    num_proc = len(os.sched_getaffinity(0))
+    data = data().map(
+        lambda batch: voc(batch['sentence'],
+            max_length=cfg.max_model_length,
+            truncation=True,
+            padding=True),
+        batched=True,
+        batch_size=256,
+        num_proc=num_proc,
+        remove_columns=('sentence',),
+        desc='tokenize',
+    )
+    id2label=dict(enumerate(data['train'].features['label'].names))
+    if 'validation' not in data:
+        data = _auto_split(data['train'])
     met = metric.ClassificationMetric()
-    def compute_metrics(batch):
-        return met.compute(
-            predictions=batch.predictions,
-            references=batch.label_ids)
-    def Trainer_shim(**kwds):
-        kwds['compute_metrics'] = compute_metrics
-        return transformers.Trainer(**kwds)
-    mod.Trainer = Trainer_shim
+    # so this is a little bit awkward, but we want the caller to have
+    # control of WHEN the model is brought into memory.  So instead of
+    # constructing the trainer, we provide the constructor and args.
+    return BatchAutoScaleTrainer, {
+        'args': args,
+        'model_init': lambda _=None: (
+            transformers.AutoModelForSequenceClassification.from_pretrained(
+                src, id2label=id2label)),
+        'tokenizer': voc,
+        'compute_metrics': lambda eval_pred: met.compute(
+            predictions=eval_pred[0],
+            references=eval_pred[1],
+        ),
+        'train_dataset': data['train'],
+        'eval_dataset': data['validation'],
+        'data_collator': transformers.default_data_collator,
+    }
 
 def finetune(task, data, **kwds):
-    path = pretrain(**kwds)
-    src = transformers.AutoConfig.from_pretrained(path)
-    voc = transformers.AutoTokenizer.from_pretrained(path)
-    dst = '/'.join((
-        'model', task, src.model_type,
-        'L={num_hidden_layers},H={hidden_size},N={max_model_length}'.format(
-            **vars(src)),
-        voc.get_name(),
-    ))
-    if os.path.exists(f'{dst}/config.json'):
-        return dst
-    patch_finetune(run_glue, data)
-    batch_size_autoscale(lambda batch_size, gradient_accumulation_steps:
-        train(run_glue.main,
-            '--model_name_or_path', path,
-            '--seed=54321',
-            '--task_name=task',
-            '--do_train',
-            '--do_eval',
-            '--per_device_train_batch_size', str(batch_size),
-            '--per_device_eval_batch_size', str(batch_size),
-            '--gradient_accumulation_steps', str(gradient_accumulation_steps),
-            '--evaluation_strategy=steps',
-            '--output_dir', dst,
-            '--max_seq_length', str(src.max_model_length),
-            '--learning_rate=2e-5',
-            '--num_train_epochs=4',
-        ))
-    drop_checkpoints(dst)
+    dst = model_path(task, **kwds)
+    if not os.path.exists(f'{dst}/config.json'):
+        src = pretrain(**kwds)
+        tr = finetune_trainer(task, data, src, dst)
+        trainer = tr[0](**tr[1])
+        last_checkpoint = transformers.trainer_utils.get_last_checkpoint(dst)
+        n_params = sum(dict((p.data_ptr(), p.numel()) for p in trainer.model.parameters()).values())
+        transformers.trainer.logger.info(
+            'Training new %.3fM parameter model %s' % (
+                n_params / 1000000, dst))
+        transformers.set_seed(trainer.args.seed)
+        trainer.train(resume_from_checkpoint=last_checkpoint)
+        final_save(trainer)
     return dst
